@@ -8787,7 +8787,7 @@ class _SideMethod:
             return
         if self.name in ("CB", "FLOW"):
             _blocked, _guard_rec = _post_loss_guard.evaluate(
-                self.name, ctx["side"], ctx.get("_ds_series"), ctx.get("slug"))
+                self.name, ctx["side"], _post_loss_spot_series(), ctx.get("slug"))
             if _blocked:
                 self.log({**_guard_rec, "kind": self.name + "_POST_LOSS_BLOCK"})
                 return
