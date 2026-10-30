@@ -52,6 +52,113 @@ from collections import deque
 from typing import Optional, Tuple, Any, List, Dict
 
 import websocket
+"""Read-only post-loss guards for CB/FLOW/TW. No trading/order APIs."""
+import threading, time
+from collections import deque
+import requests
+
+class BinancePerpCVD:
+    URL = "https://fapi.binance.com/fapi/v1/aggTrades"
+    def __init__(self, symbol="BTCUSDT", poll_sec=1.0):
+        self.symbol=symbol; self.poll_sec=max(.5,float(poll_sec))
+        self.lock=threading.Lock(); self.rows=deque(maxlen=100000)
+        self.last_id=None; self.last_ts=0.; self.errors=0; self.started_at=None
+        self.stop_event=threading.Event(); self.thread=None
+    def start(self):
+        if not self.thread or not self.thread.is_alive():
+            self.thread=threading.Thread(target=self._run,name="PerpCVD",daemon=True); self.thread.start()
+    def _poll(self):
+        p={"symbol":self.symbol,"limit":1000}
+        if self.last_id is not None: p["fromId"]=self.last_id+1
+        r=requests.get(self.URL,params=p,timeout=4); r.raise_for_status(); data=r.json()
+        if not isinstance(data,list): raise ValueError("Invalid Futures aggTrades response")
+        if self.last_id is None:
+            if data:
+                self.last_id=max(int(x["a"]) for x in data)
+                self.started_at=time.time()
+            return
+        points=[]
+        # Drain multiple pages so a busy second cannot silently lose >1000 aggTrades.
+        for page in range(5):
+            for x in data:
+                aid=int(x["a"])
+                if aid<=self.last_id: continue
+                ts=int(x["T"])/1000.; q=float(x["q"])
+                points.append((ts,-q if bool(x["m"]) else q,aid))
+            if len(data)<1000: break
+            next_id=max(int(x["a"]) for x in data)+1
+            r=requests.get(self.URL,params={"symbol":self.symbol,"limit":1000,"fromId":next_id},timeout=4)
+            r.raise_for_status(); data=r.json()
+            if not isinstance(data,list): raise ValueError("Invalid Futures aggTrades response")
+            if not data: break
+        points.sort()
+        with self.lock:
+            for ts,q,aid in points:
+                self.rows.append((ts,q)); self.last_ts=max(self.last_ts,ts)
+                self.last_id=max(self.last_id or aid,aid)
+    def _run(self):
+        while not self.stop_event.is_set():
+            t=time.time()
+            try: self._poll()
+            except Exception: self.errors+=1
+            self.stop_event.wait(max(.1,self.poll_sec-(time.time()-t)))
+    def cvd(self,seconds=30,now=None):
+        now=time.time() if now is None else float(now)
+        with self.lock: rows=list(self.rows); last=self.last_ts; started=self.started_at
+        if not rows or started is None or now-started<seconds-3 or now-last>3 or rows[0][0]>now-seconds+3: return None
+        return sum(q for ts,q in rows if now-seconds<=ts<=now)
+
+def ds_velocity(series,seconds,now=None):
+    if not series: return None
+    now=time.time() if now is None else float(now)
+    pts=sorted((float(t),float(v)) for t,v in series if float(t)<=now)
+    if len(pts)<2: return None
+    et,ev=pts[-1]; target=et-float(seconds)
+    starts=[(t,v) for t,v in pts if t<=target]
+    if not starts or now-et>6: return None
+    st,sv=starts[-1]
+    if target-st>8 or et-st<seconds-1: return None
+    return ev-sv
+
+class PostLossGuard:
+    def __init__(self,logger=None):
+        self.perp=BinancePerpCVD(symbol=BINANCE_SYMBOL); self.logger=logger or (lambda x:None)
+        self.hist={k:deque(maxlen=2) for k in ("CB","FLOW","TW")}
+        self.lock=threading.Lock()
+    def start(self): self.perp.start()
+    def evaluate(self,strategy,side,spot_series,slug=None,now=None,ds_series=None):
+        name=str(strategy).upper()
+        if name not in self.hist: return False,{"reason":"NOT_APPLICABLE"}
+        now=time.time() if now is None else float(now)
+        d=1 if str(side).upper() in ("UP","UPWARD") else -1
+        # vel_15/30/60 son velocidades de Binance spot; TW además usa DS vel_30.
+        snap={"ts":now,"slug":slug,"side":str(side).upper(),
+              "vel_15s":ds_velocity(spot_series,15,now),
+              "vel_30s":ds_velocity(spot_series,30,now),
+              "vel_60s":ds_velocity(spot_series,60,now),
+              "ds_vel_30s":ds_velocity(ds_series,30,now) if ds_series is not None else None,
+              "cvd_perp_30s":self.perp.cvd(30,now)}
+        required={"CB":("vel_15s","vel_30s","vel_60s"),
+                  "FLOW":("vel_15s","cvd_perp_30s"),
+                  "TW":("vel_15s","ds_vel_30s","cvd_perp_30s")}[name]
+        missing=[k for k in required if snap[k] is None]
+        with self.lock:
+            h=self.hist[name]; h.append(snap); prev=h[-2] if len(h)>1 else None
+        adv=lambda k,x: x is not None and x*d<0
+        if missing: blocked,reason=True,"INSUFFICIENT_DATA"
+        elif name=="CB":
+            blocked=all(adv(k,snap[k]) for k in required)
+            reason="CB_TRIPLE_VELOCITY_ADVERSE" if blocked else "CLEAR"
+        elif prev is None or prev.get("slug") != slug or prev.get("side") != str(side).upper() or now-prev["ts"]>6 or now<=prev["ts"]:
+            blocked,reason=False,"WAITING_FOR_SECOND_SAMPLE"
+        else:
+            blocked=all(adv(k,snap[k]) and adv(k,prev[k]) for k in required)
+            reason=name+"_PERSISTENT_ADVERSE" if blocked else "CLEAR"
+        record={"kind":"POST_LOSS_GUARD","strategy":name,"blocked":blocked,
+                "reason":reason,"missing":missing,**snap}
+        try: self.logger(record)
+        except Exception: pass
+        return blocked,record
 from eth_account import Account
 from py_clob_client_v2.client import ClobClient
 
@@ -8131,7 +8238,7 @@ def tw_tick(client):
     if not TW_ENABLE:
         return
     try:
-        _shadow_ds.start()
+        _shadow_ds.start(); _post_loss_guard.start()
         _tw_resolve_kick()
         st = _tw_state()
         # 2026-10-26: apagado (tras pérdida) o trading deshabilitado → MODO PAPEL: sigue evaluando
@@ -8216,6 +8323,10 @@ def tw_tick(client):
         if v0 is None or (cur - v0) * sg < TW_V10_MIN:
             return
         side = "UP" if sg > 0 else "DN"
+        _blocked, _guard_rec = _post_loss_guard.evaluate("TW", side, _post_loss_spot_series(), S.slug, now, ds_series=ser)
+        if _blocked:
+            _tw_log({**_guard_rec, "kind": "TW_POST_LOSS_BLOCK"})
+            return
         token_id = S.tokens[0] if side == "UP" else S.tokens[1]
         b = S.book.get(token_id, {})
         ws_ask = safe_float(b.get("best_ask"), None)
@@ -8503,6 +8614,23 @@ class _FlowFeeds:
 
 
 _flow_feeds = _FlowFeeds()
+
+def _post_loss_guard_log(record):
+    try:
+        with open("post_loss_guard_log.jsonl", "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
+
+_post_loss_guard = PostLossGuard(logger=_post_loss_guard_log)
+
+def _post_loss_spot_series():
+    try:
+        with spot_tracker.lock:
+            return list(spot_tracker.prices)
+    except Exception:
+        return []
+
 _PM_TRADES = deque(maxlen=50000)     # (ts, asset_id, side, size, price) — del WebSocket del libro
 
 
@@ -8657,6 +8785,12 @@ class _SideMethod:
         ok_rule, info = self.rule(ctx)
         if not ok_rule:
             return
+        if self.name in ("CB", "FLOW"):
+            _blocked, _guard_rec = _post_loss_guard.evaluate(
+                self.name, ctx["side"], _post_loss_spot_series(), ctx.get("slug"))
+            if _blocked:
+                self.log({**_guard_rec, "kind": self.name + "_POST_LOSS_BLOCK"})
+                return
         now = time.time()
         _ev = pausa_evento(now)
         if _ev:                                  # 10-28: pausa por calendario (FOMC, CPI, empleo…)
@@ -8878,7 +9012,7 @@ def side_methods_tick(client):
     if not (FLOW_ENABLE or CB_ENABLE or LATE_ENABLE or QUIET_ENABLE):
         return
     try:
-        _shadow_ds.start(); _flow_feeds.start()
+        _shadow_ds.start(); _flow_feeds.start(); _post_loss_guard.start()
         if not S.slug or len(S.tokens) != 2:
             return
         epoch = int(str(S.slug).split("-")[-1]); now = time.time(); el = now - epoch
@@ -8936,7 +9070,8 @@ def side_methods_tick(client):
                "v60": round((cur - v0) * sg, 2) if v0 is not None else None,
                "pm_net": round(pm * sg, 1) if pm is not None else None,
                "cvd_bn60": round(_flow_feeds.cvd("bn", 60) * sg, 3),
-               "cvd_cb30": round(_flow_feeds.cvd("cb", 30) * sg, 3)}
+               "cvd_cb30": round(_flow_feeds.cvd("cb", 30) * sg, 3),
+               "_ds_series": ser}
         for m in _SIDE_METHODS:
             try:
                 m.tick(client, ctx)
