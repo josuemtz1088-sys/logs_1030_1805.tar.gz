@@ -126,19 +126,21 @@ class PostLossGuard:
         self.hist={k:deque(maxlen=2) for k in ("CB","FLOW","TW")}
         self.lock=threading.Lock()
     def start(self): self.perp.start()
-    def evaluate(self,strategy,side,series,slug=None,now=None):
+    def evaluate(self,strategy,side,spot_series,slug=None,now=None,ds_series=None):
         name=str(strategy).upper()
         if name not in self.hist: return False,{"reason":"NOT_APPLICABLE"}
         now=time.time() if now is None else float(now)
-        d=1 if str(side).upper()=="UP" else -1
+        d=1 if str(side).upper() in ("UP","UPWARD") else -1
+        # vel_15/30/60 son velocidades de Binance spot; TW además usa DS vel_30.
         snap={"ts":now,"slug":slug,"side":str(side).upper(),
-              "vel_15s":ds_velocity(series,15,now),
-              "vel_30s":ds_velocity(series,30,now),
-              "vel_60s":ds_velocity(series,60,now),
+              "vel_15s":ds_velocity(spot_series,15,now),
+              "vel_30s":ds_velocity(spot_series,30,now),
+              "vel_60s":ds_velocity(spot_series,60,now),
+              "ds_vel_30s":ds_velocity(ds_series,30,now) if ds_series is not None else None,
               "cvd_perp_30s":self.perp.cvd(30,now)}
         required={"CB":("vel_15s","vel_30s","vel_60s"),
                   "FLOW":("vel_15s","cvd_perp_30s"),
-                  "TW":("vel_15s","vel_30s","cvd_perp_30s")}[name]
+                  "TW":("vel_15s","ds_vel_30s","cvd_perp_30s")}[name]
         missing=[k for k in required if snap[k] is None]
         with self.lock:
             h=self.hist[name]; h.append(snap); prev=h[-2] if len(h)>1 else None
@@ -8321,7 +8323,7 @@ def tw_tick(client):
         if v0 is None or (cur - v0) * sg < TW_V10_MIN:
             return
         side = "UP" if sg > 0 else "DN"
-        _blocked, _guard_rec = _post_loss_guard.evaluate("TW", side, ser, S.slug, now)
+        _blocked, _guard_rec = _post_loss_guard.evaluate("TW", side, _post_loss_spot_series(), S.slug, now, ds_series=ser)
         if _blocked:
             _tw_log({**_guard_rec, "kind": "TW_POST_LOSS_BLOCK"})
             return
@@ -8621,6 +8623,14 @@ def _post_loss_guard_log(record):
         pass
 
 _post_loss_guard = PostLossGuard(logger=_post_loss_guard_log)
+
+def _post_loss_spot_series():
+    try:
+        with spot_tracker.lock:
+            return list(spot_tracker.prices)
+    except Exception:
+        return []
+
 _PM_TRADES = deque(maxlen=50000)     # (ts, asset_id, side, size, price) — del WebSocket del libro
 
 
