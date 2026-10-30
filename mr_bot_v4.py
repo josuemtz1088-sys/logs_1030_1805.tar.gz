@@ -122,7 +122,7 @@ def ds_velocity(series,seconds,now=None):
 
 class PostLossGuard:
     def __init__(self,logger=None):
-        self.perp=BinancePerpCVD(); self.logger=logger or (lambda x:None)
+        self.perp=BinancePerpCVD(symbol=BINANCE_SYMBOL); self.logger=logger or (lambda x:None)
         self.hist={k:deque(maxlen=2) for k in ("CB","FLOW","TW")}
         self.lock=threading.Lock()
     def start(self): self.perp.start()
