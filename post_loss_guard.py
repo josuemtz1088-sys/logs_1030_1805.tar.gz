@@ -83,7 +83,7 @@ class PostLossGuard:
         elif name=="CB":
             blocked=all(adv(k,snap[k]) for k in required)
             reason="CB_TRIPLE_VELOCITY_ADVERSE" if blocked else "CLEAR"
-        elif prev is None or now-prev["ts"]>6 or now<=prev["ts"]:
+        elif prev is None or prev.get("slug") != slug or prev.get("side") != str(side).upper() or now-prev["ts"]>6 or now<=prev["ts"]:
             blocked,reason=False,"WAITING_FOR_SECOND_SAMPLE"
         else:
             blocked=all(adv(k,snap[k]) and adv(k,prev[k]) for k in required)
