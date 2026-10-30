@@ -52,6 +52,7 @@ from collections import deque
 from typing import Optional, Tuple, Any, List, Dict
 
 import websocket
+from post_loss_guard import PostLossGuard
 from eth_account import Account
 from py_clob_client_v2.client import ClobClient
 
@@ -8131,7 +8132,7 @@ def tw_tick(client):
     if not TW_ENABLE:
         return
     try:
-        _shadow_ds.start()
+        _shadow_ds.start(); _post_loss_guard.start()
         _tw_resolve_kick()
         st = _tw_state()
         # 2026-10-26: apagado (tras pérdida) o trading deshabilitado → MODO PAPEL: sigue evaluando
@@ -8216,6 +8217,10 @@ def tw_tick(client):
         if v0 is None or (cur - v0) * sg < TW_V10_MIN:
             return
         side = "UP" if sg > 0 else "DN"
+        _blocked, _guard_rec = _post_loss_guard.evaluate("TW", side, ser, S.slug, now)
+        if _blocked:
+            _tw_log({**_guard_rec, "kind": "TW_POST_LOSS_BLOCK"})
+            return
         token_id = S.tokens[0] if side == "UP" else S.tokens[1]
         b = S.book.get(token_id, {})
         ws_ask = safe_float(b.get("best_ask"), None)
@@ -8503,6 +8508,15 @@ class _FlowFeeds:
 
 
 _flow_feeds = _FlowFeeds()
+
+def _post_loss_guard_log(record):
+    try:
+        with open("post_loss_guard_log.jsonl", "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
+
+_post_loss_guard = PostLossGuard(logger=_post_loss_guard_log)
 _PM_TRADES = deque(maxlen=50000)     # (ts, asset_id, side, size, price) — del WebSocket del libro
 
 
@@ -8657,6 +8671,12 @@ class _SideMethod:
         ok_rule, info = self.rule(ctx)
         if not ok_rule:
             return
+        if self.name in ("CB", "FLOW"):
+            _blocked, _guard_rec = _post_loss_guard.evaluate(
+                self.name, ctx["side"], ctx.get("_ds_series"), ctx.get("slug"))
+            if _blocked:
+                self.log({**_guard_rec, "kind": self.name + "_POST_LOSS_BLOCK"})
+                return
         now = time.time()
         _ev = pausa_evento(now)
         if _ev:                                  # 10-28: pausa por calendario (FOMC, CPI, empleo…)
@@ -8878,7 +8898,7 @@ def side_methods_tick(client):
     if not (FLOW_ENABLE or CB_ENABLE or LATE_ENABLE or QUIET_ENABLE):
         return
     try:
-        _shadow_ds.start(); _flow_feeds.start()
+        _shadow_ds.start(); _flow_feeds.start(); _post_loss_guard.start()
         if not S.slug or len(S.tokens) != 2:
             return
         epoch = int(str(S.slug).split("-")[-1]); now = time.time(); el = now - epoch
@@ -8936,7 +8956,8 @@ def side_methods_tick(client):
                "v60": round((cur - v0) * sg, 2) if v0 is not None else None,
                "pm_net": round(pm * sg, 1) if pm is not None else None,
                "cvd_bn60": round(_flow_feeds.cvd("bn", 60) * sg, 3),
-               "cvd_cb30": round(_flow_feeds.cvd("cb", 30) * sg, 3)}
+               "cvd_cb30": round(_flow_feeds.cvd("cb", 30) * sg, 3),
+               "_ds_series": ser}
         for m in _SIDE_METHODS:
             try:
                 m.tick(client, ctx)
